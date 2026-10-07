@@ -1,0 +1,4 @@
+youtube_url,video_id,status,error,n_clips,clips_dir,processed_at,extract_status,extract_error
+https://www.youtube.com/watch?v=o-Ikkh5oxuo,o-Ikkh5oxuo,processed,,2,Dataset/raw_videos/o-Ikkh5oxuo,2026-10-07T19:31:39.798542+00:00,extracted,
+https://www.youtube.com/watch?v=2l8dNRfZit0,2l8dNRfZit0,processed,,2,Dataset/raw_videos/2l8dNRfZit0,2026-10-07T19:37:22.376055+00:00,extracted,
+https://www.youtube.com/watch?v=JKa05nyUmuQ&,JKa05nyUmuQ,processed,,6,Dataset/raw_videos/JKa05nyUmuQ,2026-10-07T20:57:46.762172+00:00,extracted,

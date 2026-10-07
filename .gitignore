@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Pipeline outputs. The only tracked dataset input is Dataset/metadata/youtube_links.csv.
+Dataset/extracted/
+Dataset/raw_videos/
+Dataset/videos/
+Dataset/metadata/*
+!Dataset/metadata/youtube_links.csv
+*.mp4
+*.mkv
+*.webm
+*.m4v
+*.mov
+*.pt
+*.tmp

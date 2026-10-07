@@ -1,0 +1,13 @@
+# Python 3.12.
+# These versions were installed together and `python -m pip check` reported no broken requirements.
+yt-dlp==2026.8.19
+opencv-python-headless==5.0.0.93
+numpy==2.5.3
+torch==2.14.1
+transformers==5.19.0
+Pillow==12.3.0
+python-dotenv==1.2.4
+google-genai==2.28.0
+langchain-core==1.6.7
+BigVGAN==2.4.0
+# pip install -e git+https://github.com/awei-6/BigVGAN.git@main#egg=BigVGAN
