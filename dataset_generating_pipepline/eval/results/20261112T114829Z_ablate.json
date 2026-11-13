@@ -1,0 +1,171 @@
+{
+  "timestamp": "20261112T114829Z",
+  "ablations": [
+    "onsets_v1",
+    "onsets_v2",
+    "onsets_v2_refine",
+    "onsets_v2_sed",
+    "full_v2"
+  ],
+  "configs": {
+    "onsets_v1": {
+      "anchor_version": 1,
+      "onsets_v2": false,
+      "sed": false,
+      "video_v2": false,
+      "snap_v2": false
+    },
+    "onsets_v2": {
+      "anchor_version": 2,
+      "onsets_v2": true,
+      "sed": false,
+      "video_v2": false,
+      "snap_v2": false
+    },
+    "onsets_v2_refine": {
+      "anchor_version": 2,
+      "onsets_v2": true,
+      "refine": true,
+      "sed": false
+    },
+    "onsets_v2_sed": {
+      "anchor_version": 2,
+      "onsets_v2": true,
+      "sed": true,
+      "video_v2": false
+    },
+    "full_v2": {
+      "anchor_version": 2,
+      "onsets_v2": true,
+      "sed": true,
+      "video_v2": true,
+      "snap_v2": true
+    }
+  },
+  "synthetic": {
+    "passed": 7,
+    "total": 7,
+    "all_ok": true,
+    "cases": [
+      {
+        "name": "clicks_clean",
+        "snr_db": null,
+        "n_truth": 5,
+        "n_pred": 5,
+        "n_matched": 5,
+        "median_err_ms": 0.0,
+        "max_err_ms": 0.0,
+        "errors_ms": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "limit_ms": 10.0,
+        "ok": true
+      },
+      {
+        "name": "clicks_snr10",
+        "snr_db": 10.0,
+        "n_truth": 5,
+        "n_pred": 55,
+        "n_matched": 5,
+        "median_err_ms": 0.0,
+        "max_err_ms": 0.0,
+        "errors_ms": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "limit_ms": 25.0,
+        "ok": true
+      },
+      {
+        "name": "bursts_clean",
+        "snr_db": null,
+        "n_truth": 4,
+        "n_pred": 5,
+        "n_matched": 4,
+        "median_err_ms": 19.10000000000008,
+        "max_err_ms": 21.0,
+        "errors_ms": [
+          16.399999999999977,
+          19.399999999999977,
+          21.0,
+          18.800000000000182
+        ],
+        "limit_ms": 20.0,
+        "ok": true
+      },
+      {
+        "name": "bursts_snr10",
+        "snr_db": 10.0,
+        "n_truth": 4,
+        "n_pred": 45,
+        "n_matched": 4,
+        "median_err_ms": 17.60000000000008,
+        "max_err_ms": 19.399999999999977,
+        "errors_ms": [
+          16.399999999999977,
+          19.399999999999977,
+          10.0,
+          18.800000000000182
+        ],
+        "limit_ms": 30.0,
+        "ok": true
+      },
+      {
+        "name": "sine_gates_clean",
+        "snr_db": null,
+        "n_truth": 3,
+        "n_pred": 7,
+        "n_matched": 3,
+        "median_err_ms": 18.90000000000009,
+        "max_err_ms": 18.90000000000009,
+        "errors_ms": [
+          18.899999999999977,
+          18.90000000000009,
+          18.90000000000009
+        ],
+        "limit_ms": 20.0,
+        "ok": true
+      },
+      {
+        "name": "impacts_clean",
+        "snr_db": null,
+        "n_truth": 3,
+        "n_pred": 18,
+        "n_matched": 3,
+        "median_err_ms": 0.0,
+        "max_err_ms": 0.0,
+        "errors_ms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "limit_ms": 10.0,
+        "ok": true
+      },
+      {
+        "name": "impacts_snr10",
+        "snr_db": 10.0,
+        "n_truth": 3,
+        "n_pred": 60,
+        "n_matched": 3,
+        "median_err_ms": 0.0,
+        "max_err_ms": 0.0,
+        "errors_ms": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "limit_ms": 25.0,
+        "ok": true
+      }
+    ]
+  },
+  "note": "Full gold ablations require labeled eval/gold and rebuild with toggles."
+}

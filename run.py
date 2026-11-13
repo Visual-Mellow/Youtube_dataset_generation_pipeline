@@ -13,7 +13,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-TARGET = ROOT / "dataset_generating_pipepline" / "run_youtube_links.py"
+PACKAGE = ROOT / "dataset_generating_pipepline"
+TARGET = PACKAGE / "run_youtube_links.py"
+
+# Ensure package-local imports (core.*, utils.*, …) resolve when launched via runpy.
+if str(PACKAGE) not in sys.path:
+    sys.path.insert(0, str(PACKAGE))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 if __name__ == "__main__":

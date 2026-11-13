@@ -21,17 +21,24 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 LOG = logging.getLogger("visualmellow.dataset")
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "2.0.0"
+SCHEMA_VERSION = "2.0.0"
 VIDEO_TYPES = {"ACTION", "DIALOGUE", "ESTABLISHING", "CHASE", "FIGHT", "REVEAL", "EMOTIONAL", "HORROR_TENSION", "TRAVEL", "OTHER"}
-AUDIO_TYPES = {"SFX", "AMBIENCE", "MUSIC", "MOVIE_BGM", "NARRATOR"}
+AUDIO_TYPES = {"SFX", "AMBIENCE", "MUSIC", "MOVIE_BGM", "NARRATOR", "DIALOGUE"}
 EVENT_TYPES = {"INSTANT", "EVENT", "CONTINUOUS", "SEGMENT", "GLOBAL"}
 ALIGNMENT_RELATIONS = {"SYNCHRONOUS", "ANTICIPATORY", "REACTIVE", "CONTEXTUAL", "TRANSITIONAL"}
+VALID_SOURCES = {"gemini", "gemini+dsp", "asr", "foley_agent", "audio_only_agent"}
 VIDEO_MODEL_DEFAULT = "MCG-NJU/videomae-base"
 GEMINI_MODEL_DEFAULT = "gemini-3-flash-preview"
 TOKEN_WINDOW_S = 4.0
 TOKEN_FRAMES = 16
 LOGGER_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _VIDEOMAE_CACHE: dict[tuple[str, str], tuple[Any, Any, Any]] = {}
+
+# Pipeline dir on sys.path so perception/annotate/config import cleanly.
+_PIPELINE_DIR = Path(__file__).resolve().parent
+if str(_PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(_PIPELINE_DIR))
 
 DATASET_EXPLANATION_SUFFIX = r"""
 
@@ -60,6 +67,8 @@ For each useful cue return every field:
 - start_time_ms, duration_ms, end_time_ms: integer clip-relative timing, with end_time_ms = start_time_ms + duration_ms and end_time_ms <= clip duration.
 - visual_evidence: concise visible evidence. Do not invent off-screen action.
 - source_audio_context: what the original audio contributes, or "not clearly audible". Keep separate from the generated cue description.
+
+Try to generate as many cues as you can indentify in the clip.
 
 Ontology guidance: INSTANT is a near-point event; EVENT is a short non-zero event; CONTINUOUS is a sustained source; SEGMENT is tied to a narrative segment; GLOBAL spans essentially the full clip. SYNCHRONOUS hits the event; ANTICIPATORY begins before it; REACTIVE follows it; CONTEXTUAL establishes/maintains the scene; TRANSITIONAL accompanies a narrative transition. Keep cues sparse and avoid duplicates. Return [] when no cue is justified.
 
@@ -143,7 +152,11 @@ def validate_video(path: Path, expected_duration_ms: int | None = None) -> dict[
 
 
 def _model_explanation_prompt() -> tuple[str, str, str]:
-    """Build the existing explanation prompt with the dataset video-type taxonomy."""
+    """Build the existing explanation prompt with the dataset video-type taxonomy.
+
+    Kept for cache-validation of legacy v1 artifacts. New annotations use
+    ``annotate.prompts.EXPLANATION_PROMPT`` via the orchestrator.
+    """
     from Utils.prompts import gemini_explain_visual_story_prompt
     raw_prompt = gemini_explain_visual_story_prompt.template
     prompt = gemini_explain_visual_story_prompt.format(director_prompt="(none provided)", video_duration_ms="{duration}")
@@ -200,11 +213,13 @@ def _load_local_env() -> None:
             load_dotenv(path, override=False)
 
 
-def _gemini_json(model: str, prompt: str, video: bytes) -> Any:
+def _gemini_json(model: str, prompt: str, video: bytes, *, video_fps: int | None = None) -> Any:
     """Send the original audiovisual clip through VisualMellow's Gemini wrapper."""
     _load_local_env()
     from Utils.llm import query_gemini_multimodal
-    result = query_gemini_multimodal(model, prompt, video_bytes=video, mime_type="video/mp4")
+    result = query_gemini_multimodal(
+        model, prompt, video_bytes=video, mime_type="video/mp4", video_fps=video_fps,
+    )
     if result is None:
         raise RuntimeError("Gemini multimodal request returned no parsed JSON")
     return result
@@ -246,12 +261,31 @@ def _video_id(video_dir: Path, metadata: dict[str, Any]) -> str:
     return str(metadata.get("video_id") or video_dir.name)
 
 
-def _clip_paths(output_dir: Path, video_id: str, clip_id: str) -> dict[str, Path]:
-    """Return the canonical output paths for one clip's artifacts."""
+def _clip_paths(output_dir: Path, video_id: str, clip_id: str, processing_level: str = "low") -> dict[str, Path]:
+    """Return the canonical output paths for one clip's artifacts.
+
+    Perception is shared across levels; annotations are per-level so LOW and
+    HIGH can coexist under the same clip directory.
+    """
     base = output_dir / "features" / video_id / clip_id
-    return {"base": base, "tokens": base / "video_tokens.pt", "times": base / "token_timestamps.json",
-            "token_meta": base / "video_token_metadata.json", "explanation": base / "gemini_explanation.json",
-            "cues": base / "cue_annotations.json", "record": base / "record.json"}
+    ann = base / "annotations" / processing_level
+    return {
+        "base": base,
+        "perception": base / "perception",
+        "annotations": ann,
+        "tokens": base / "video_tokens.pt",
+        "times": base / "token_timestamps.json",
+        "token_meta": base / "video_token_metadata.json",
+        "explanation": ann / "gemini_explanation.json",
+        "cues": ann / "cue_annotations.json",
+        "rejected": ann / "rejected_cues.json",
+        "verifier_log": ann / "verifier_log.jsonl",
+        "record": ann / "record.json",
+        # Legacy v1 paths (read-only fallback for old artifacts).
+        "legacy_explanation": base / "gemini_explanation.json",
+        "legacy_cues": base / "cue_annotations.json",
+        "legacy_record": base / "record.json",
+    }
 
 
 def _load_cached_tokens(paths: dict[str, Path], torch: Any, clip_sha256: str) -> tuple[Any, list[dict[str, int]], dict[str, Any]] | None:
@@ -490,10 +524,13 @@ def normalize_cues(response: Any, duration_ms: int) -> tuple[list[dict[str, Any]
         cue_id = str(raw.get("cue_id") or f"cue_{i:03d}")
         if any(c["cue_id"] == cue_id for c in cues):
             cue_id = f"{cue_id}_{i:03d}"
+        src = str(raw.get("source") or "gemini")
+        if src not in VALID_SOURCES:
+            src = "gemini"
         cues.append({"cue_id": cue_id, **fields, "start_time_ms": start, "duration_ms": dur, "end_time_ms": end,
                      "temporal_annotation": {"start_time_ms": start, "duration_ms": dur, "end_time_ms": end,
-                                             "source": "gemini", "annotation_type": "pseudo_ground_truth"},
-                     "source": "gemini", "annotation_type": "pseudo_ground_truth"})
+                                             "source": src, "annotation_type": "pseudo_ground_truth"},
+                     "source": src, "annotation_type": "pseudo_ground_truth"})
     validate_cues(cues, duration_ms)
     return cues, normalizations
 
@@ -510,11 +547,14 @@ def validate_cues(cues: Any, duration_ms: int) -> None:
         start, duration, end = int(cue["start_time_ms"]), int(cue["duration_ms"]), int(cue["end_time_ms"])
         if start < 0 or duration <= 0 or end != start + duration or end > duration_ms:
             raise ValueError(f"Cue {i} has invalid time interval {start}+{duration}={end}, clip={duration_ms}")
-        if cue["source"] != "gemini" or cue["annotation_type"] != "pseudo_ground_truth":
-            raise ValueError(f"Cue {i} provenance must be Gemini pseudo-ground-truth")
+        if cue["source"] not in VALID_SOURCES or cue["annotation_type"] != "pseudo_ground_truth":
+            raise ValueError(f"Cue {i} provenance must be gemini/gemini+dsp pseudo-ground-truth")
         ann = cue.get("temporal_annotation", {})
-        if (ann.get("source"), ann.get("annotation_type")) != ("gemini", "pseudo_ground_truth"):
-            raise ValueError(f"Cue {i} temporal annotation provenance is invalid")
+        if ann:
+            if ann.get("annotation_type") != "pseudo_ground_truth":
+                raise ValueError(f"Cue {i} temporal annotation provenance is invalid")
+            if ann.get("source") not in VALID_SOURCES and ann.get("source") is not None:
+                raise ValueError(f"Cue {i} temporal annotation source is invalid")
 
 
 def _artifact_provenance(model: str, prompt_name: str, prompt_hash: str, clip: Path,
@@ -526,19 +566,37 @@ def _artifact_provenance(model: str, prompt_name: str, prompt_hash: str, clip: P
 
 
 def process_clip(video_dir: Path, clip_entry: dict[str, Any], output_dir: Path, status_path: Path, status_doc: dict[str, Any],
-                 *, video_model: str, gemini_model: str, device: str, max_retries: int, force: bool) -> str:
-    """Resume or process one clip while tracking status and caching each stage."""
+                 *, video_model: str, gemini_model: str, device: str, max_retries: int, force: bool,
+                 processing_level: str = "low", pipeline_cfg: Any | None = None) -> str:
+    """Resume or process one clip while tracking status and caching each stage.
+
+    Stages: VideoMAE tokens → Layer-0 perception → Gemini annotate (LOW/HIGH).
+    """
+    from core.config import load_pipeline_config
+    from perception.anchors import load_or_build_anchors
+    from annotate.orchestrator import annotate_clip
+    from utils.ui_log import UILogWriter
+
+    cfg = pipeline_cfg or load_pipeline_config(processing_level)
+    level = cfg.level
+
     video_id = str(status_doc.get("video_id") or video_dir.name)
     clip_id = str(clip_entry["clip_id"])
     clip_path = video_dir / str(clip_entry["filename"])
     expected_ms = int(clip_entry["duration_ms"])
     source_video_metadata = _load_json(video_dir / "video_metadata.json")
-    paths = _clip_paths(output_dir, video_id, clip_id)
+    paths = _clip_paths(output_dir, video_id, clip_id, level)
     paths["base"].mkdir(parents=True, exist_ok=True)
-    ledger = status_doc.setdefault("clips", {}).setdefault(clip_id, {"status": "pending", "attempts": 0})
+    paths["annotations"].mkdir(parents=True, exist_ok=True)
+    paths["perception"].mkdir(parents=True, exist_ok=True)
+
+    # Ledger key includes level so LOW and HIGH can complete independently.
+    ledger_key = f"{clip_id}:{level}"
+    ledger = status_doc.setdefault("clips", {}).setdefault(ledger_key, {
+        "status": "pending", "attempts": 0, "clip_id": clip_id, "processing_level": level,
+    })
     if ledger.get("status") == "processing":
-        # The global dataset lock proves no older builder is still alive.
-        LOG.warning("Recovering interrupted processing state for %s/%s", video_id, clip_id)
+        LOG.warning("Recovering interrupted processing state for %s/%s (%s)", video_id, clip_id, level)
         ledger.update(status="pending", error="Recovered stale processing status after previous run stopped")
         _save_status(status_path, status_doc)
     if ledger.get("status") == "completed" and not force:
@@ -547,32 +605,51 @@ def process_clip(video_dir: Path, clip_entry: dict[str, Any], output_dir: Path, 
             completed_video_meta = validate_video(clip_path, expected_ms)
             if not completed_video_meta["has_audio"]:
                 raise ValueError("Completed clip no longer has its original audio stream")
-            # Prompts and cue bounds use the encoded clip's probed duration. Use
-            # that same value for cache validation, since stream durations can
-            # differ slightly from the requested source interval at frame edges.
-            if cache_is_current(paths, clip_path=clip_path, duration_ms=completed_video_meta["duration_ms"],
-                                video_model=video_model, gemini_model=gemini_model):
-                return "skipped"
-            LOG.debug("[%s/%s] cached artifacts are stale; refreshing only invalid stages", video_id, clip_id)
-            ledger.update(status="pending", error="Cached artifacts do not match current model/prompt versions")
+            if paths["cues"].is_file() and paths["record"].is_file():
+                cue_doc = _load_json(paths["cues"])
+                if cue_doc.get("clip_sha256") == _hash_file(clip_path) and cue_doc.get("processing_level") == level:
+                    return "skipped"
+            ledger.update(status="pending", error="Cached artifacts do not match current level/sha")
         except Exception as exc:
-            LOG.warning("Completed ledger has invalid artifacts for %s/%s; retrying: %s", video_id, clip_id, exc)
+            LOG.warning("Completed ledger has invalid artifacts for %s/%s (%s); retrying: %s",
+                        video_id, clip_id, level, exc)
             ledger.update(status="pending", error=f"Invalid completed artifacts: {exc}")
     ledger["status"] = "processing"
     ledger["attempts"] = int(ledger.get("attempts", 0)) + 1
     ledger["started_at"] = utc_now()
     ledger["completed_at"] = None
     ledger["error"] = None
-    ledger["dataset_path"] = str(paths["base"])
+    ledger["dataset_path"] = str(paths["annotations"])
+    ledger["processing_level"] = level
     _save_status(status_path, status_doc)
+    ui_log = UILogWriter(
+        paths["annotations"] / "pipeline.ui.log",
+        fresh=force,
+        meta={
+            "title": f"{video_id}/{clip_id} (level={level})",
+            "video_id": video_id,
+            "clip_id": clip_id,
+            "processing_level": level,
+            "clip_path": str(clip_path),
+        },
+    )
+    ui_log.step_begin(
+        "clip_pipeline",
+        f"Process {video_id}/{clip_id}",
+        inputs={"expected_ms": expected_ms, "force": force, "video_model": video_model},
+    )
     try:
+        ui_log.step_begin("validate", "Validate clip video + audio")
         video_meta = validate_video(clip_path, expected_ms)
         if not video_meta["has_audio"]:
             raise ValueError("Source clip has no audio stream; this dataset requires original audiovisual Gemini input")
         clip_sha256 = _hash_file(clip_path)
-        LOG.debug("[%s/%s] video validated (%dms, audio present)", video_id, clip_id, video_meta["duration_ms"])
+        LOG.debug("[%s/%s] video validated (%dms, audio present, level=%s)",
+                  video_id, clip_id, video_meta["duration_ms"], level)
+        ui_log.step_end("validate", "clip ok", outputs={**video_meta, "clip_sha256": clip_sha256})
 
         import torch
+        ui_log.step_begin("videomae", "VideoMAE token extraction", inputs={"model": video_model, "device": device})
         cached_tokens = None if force else _load_cached_tokens(paths, torch, clip_sha256)
         tokens_reused = cached_tokens is not None
         if cached_tokens is None:
@@ -594,114 +671,171 @@ def process_clip(video_dir: Path, clip_entry: dict[str, Any], output_dir: Path, 
         else:
             tokens, token_times, token_meta = cached_tokens
             if token_meta.get("model_name") != video_model and not force:
-                # A different requested model invalidates only the token stage.
                 tokens_reused = False
                 tokens, token_times, token_meta = extract_videomae(clip_path, video_meta, video_model, device)
+                token_meta["clip_sha256"] = clip_sha256
                 atomic_torch_save(torch, tokens, paths["tokens"])
                 atomic_json(paths["times"], token_times)
                 atomic_json(paths["token_meta"], token_meta)
         token_action = "reused" if tokens_reused else "generated"
         LOG.info("%s/%s: Video tokens %s (%d x %d)",
                  video_id, clip_id, token_action, tokens.shape[0], tokens.shape[1])
+        ui_log.tool_call(
+            "videomae",
+            "extract_videomae",
+            args={"model": video_model, "reused": tokens_reused},
+            result={"shape": list(tokens.shape), "action": token_action},
+        )
+        if not tokens_reused:
+            ui_log.file_written("videomae", paths["tokens"])
+            ui_log.file_written("videomae", paths["times"])
+            ui_log.file_written("videomae", paths["token_meta"])
+        ui_log.step_end(
+            "videomae",
+            token_action,
+            outputs={"token_shape": list(tokens.shape), "paths": [str(paths["tokens"]), str(paths["times"])]},
+        )
 
-        explanation_prompt, explanation_prompt_name, _ = _model_explanation_prompt()
-        explanation_prompt = explanation_prompt.replace("{duration}", str(video_meta["duration_ms"]))
-        explanation_hash = _hash_prompt(explanation_prompt)
-        explanation = None if force else _cached_explanation(paths["explanation"], explanation_hash, gemini_model, clip_sha256)
-        explanation_reused = explanation is not None
-        if explanation is None:
-            video_bytes = clip_path.read_bytes()
-            last = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    raw = _gemini_json(gemini_model, explanation_prompt, video_bytes)
-                    if not isinstance(raw, dict):
-                        raise ValueError("Gemini explanation must be a JSON object")
-                    for key in ("video_content", "scene_gravity", "scene_interpretation", "audio_asthetics"):
-                        if not isinstance(raw.get(key), str) or not raw[key].strip():
-                            raise ValueError(f"Gemini explanation missing non-empty {key}")
-                    video_type = str(raw.get("video_type", "")).upper()
-                    if video_type not in VIDEO_TYPES:
-                        raise ValueError(f"Gemini explanation has invalid video_type {video_type!r}")
-                    raw["video_type"] = video_type
-                    explanation = {**_artifact_provenance(gemini_model, explanation_prompt_name, explanation_hash, clip_path, clip_sha256, True),
-                                   "video_duration_ms": video_meta["duration_ms"], "video_type": video_type,
-                                   "video_type_source": "gemini", "response": raw}
-                    atomic_json(paths["explanation"], explanation)
-                    break
-                except Exception as exc:
-                    last = exc
-                    if attempt >= max_retries:
-                        raise
-                    LOG.warning("Gemini explanation attempt %d/%d failed: %s", attempt, max_retries, exc)
-                    time.sleep(min(2 ** (attempt - 1), 10))
-            if explanation is None:
-                raise RuntimeError(f"Gemini explanation failed: {last}")
-        explanation_action = "reused" if explanation_reused else "generated"
-        LOG.info("%s/%s: Gemini explanation %s (%s)",
-                 video_id, clip_id, explanation_action, explanation["video_type"])
+        # ----- Layer 0 perception (local, cached) ---------------------------
+        LOG.info("%s/%s: Perception (separation=%s)…", video_id, clip_id, cfg.flags.separation)
+        ui_log.step_begin(
+            "perception",
+            "Layer-0 perception (anchors)",
+            inputs={
+                "separation": cfg.flags.separation,
+                "anchor_version": getattr(cfg, "anchor_version", cfg.perception.anchor_version),
+                "sed_backend": cfg.perception.sed.backend if cfg.perception.sed.enabled else "off",
+                "out_dir": str(paths["perception"]),
+            },
+        )
+        ui_log.tool_call(
+            "perception",
+            "demucs_separation",
+            args={"enabled": cfg.flags.separation},
+            result={"note": "runs inside build_anchors when enabled"},
+        )
+        anchors_doc = load_or_build_anchors(
+            clip_path, cfg, paths["perception"], force=force,
+        )
+        ui_log.data_block("perception", "output", "Anchor counts", anchors_doc.get("counts"))
+        ui_log.file_written("perception", paths["perception"] / "anchors.json", detail=anchors_doc.get("counts"))
+        ui_log.step_end(
+            "perception",
+            f"{anchors_doc['counts']['total']} anchors",
+            outputs={
+                "counts": anchors_doc.get("counts"),
+                "separation_used": anchors_doc.get("separation_used"),
+                "anchor_version": anchors_doc.get("anchor_version"),
+                "sed_backend": anchors_doc.get("sed_backend"),
+                "mean_snr_db": anchors_doc.get("mean_snr_db"),
+                "av_offset_ms": anchors_doc.get("av_offset_ms"),
+            },
+        )
+        LOG.info(
+            "%s/%s: Anchors ready (%d total: %s)",
+            video_id, clip_id, anchors_doc["counts"]["total"], anchors_doc["counts"],
+        )
 
-        cue_prompt_name = "gemini_decide_audio_cues_prompt_without_narrator_video+visualmellow_dsp_cue_annotation_v1"
-        cue_prompt = _build_cue_prompt(video_meta["duration_ms"], explanation["response"])
-        cue_hash = _hash_prompt(cue_prompt)
-        cue_artifact = None if force else _cached_cues(paths["cues"], cue_hash, video_meta["duration_ms"], gemini_model, clip_sha256)
-        cues_reused = cue_artifact is not None
-        if cue_artifact is None:
-            video_bytes = clip_path.read_bytes()
-            last = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    result = _gemini_json(gemini_model, cue_prompt, video_bytes)
-                    cues, normalized = normalize_cues(result, video_meta["duration_ms"])
-                    cue_artifact = {**_artifact_provenance(gemini_model, cue_prompt_name, cue_hash, clip_path, clip_sha256, True),
-                                    "annotation_type": "pseudo_ground_truth", "source": "gemini",
-                                    "normalizations": normalized, "cues": cues}
-                    atomic_json(paths["cues"], cue_artifact)
-                    break
-                except Exception as exc:
-                    last = exc
-                    if attempt >= max_retries:
-                        raise
-                    LOG.warning("Gemini cue attempt %d/%d failed: %s", attempt, max_retries, exc)
-                    time.sleep(min(2 ** (attempt - 1), 10))
-            if cue_artifact is None:
-                raise RuntimeError(f"Gemini cue annotation failed: {last}")
-        cues_action = "reused" if cues_reused else "generated"
-        LOG.info("%s/%s: Cue annotations %s (%d cues)",
-                 video_id, clip_id, cues_action, len(cue_artifact["cues"]))
+        # ----- Layers 1–3 annotate ------------------------------------------
+        last = None
+        ann_result = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                ann_result = annotate_clip(
+                    clip_path=clip_path,
+                    duration_ms=video_meta["duration_ms"],
+                    anchors_doc=anchors_doc,
+                    cfg=cfg,
+                    out_dir=paths["annotations"],
+                    clip_sha256=clip_sha256,
+                    force=force,
+                    ui_log=ui_log,
+                    ui_log_fresh=False,
+                )
+                break
+            except Exception as exc:
+                last = exc
+                if attempt >= max_retries:
+                    raise
+                LOG.warning("Annotate attempt %d/%d failed: %s", attempt, max_retries, exc)
+                time.sleep(min(2 ** (attempt - 1), 10))
+        if ann_result is None:
+            raise RuntimeError(f"Annotation failed: {last}")
 
-        record = {"schema_version": "1.0.0", "pipeline_version": PIPELINE_VERSION,
-                  "video_id": video_id, "clip_id": clip_id,
-                  "source_start_ms": int(clip_entry["source_start_ms"]), "source_end_ms": int(clip_entry["source_end_ms"]),
-                  "clip_duration_ms": video_meta["duration_ms"],
-                  "source_video": {k: source_video_metadata.get(k)
-                                   for k in ("video_id", "youtube_url", "title", "source_duration_ms", "fps", "width", "height")},
-                  "video": {"path": str(clip_path), **video_meta},
-                  "features": {"video_tokens": str(paths["tokens"].relative_to(output_dir)),
-                               "token_timestamps": str(paths["times"].relative_to(output_dir)),
-                               "token_metadata": str(paths["token_meta"].relative_to(output_dir))},
-                  "gemini_explanation": {"artifact": str(paths["explanation"].relative_to(output_dir)),
-                                        "video_type": explanation["video_type"], "video_type_source": "gemini",
-                                        "gemini_received_audio": True},
-                  "audio_cues": cue_artifact["cues"],
-                  "annotation_provenance": {"source": "gemini", "annotation_type": "pseudo_ground_truth",
-                                             "human_verified": False, "gemini_received_audio": True,
-                                             "model": gemini_model, "cue_prompt_name": cue_prompt_name,
-                                             "cue_prompt_sha256": cue_hash, "generated_at": cue_artifact["generation_timestamp"],
-                                             "normalizations": cue_artifact["normalizations"]}}
+        explanation = ann_result["explanation"]
+        cue_artifact = ann_result["cue_artifact"]
+        LOG.info(
+            "%s/%s: Annotations %s (%d cues, %d rejected, %d LLM calls, level=%s)",
+            video_id, clip_id,
+            "reused" if ann_result.get("reused") else "generated",
+            len(cue_artifact["cues"]),
+            len(cue_artifact.get("rejected_cues") or []),
+            ann_result.get("llm_call_count", 0),
+            level,
+        )
+
+        record = {
+            "schema_version": SCHEMA_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
+            "processing_level": level,
+            "video_id": video_id,
+            "clip_id": clip_id,
+            "source_start_ms": int(clip_entry["source_start_ms"]),
+            "source_end_ms": int(clip_entry["source_end_ms"]),
+            "clip_duration_ms": video_meta["duration_ms"],
+            "source_video": {k: source_video_metadata.get(k)
+                             for k in ("video_id", "youtube_url", "title", "source_duration_ms", "fps", "width", "height")},
+            "video": {"path": str(clip_path), **video_meta},
+            "features": {
+                "video_tokens": str(paths["tokens"].relative_to(output_dir)),
+                "token_timestamps": str(paths["times"].relative_to(output_dir)),
+                "token_metadata": str(paths["token_meta"].relative_to(output_dir)),
+                "perception": str(paths["perception"].relative_to(output_dir)),
+            },
+            "gemini_explanation": {
+                "artifact": str(paths["explanation"].relative_to(output_dir)),
+                "video_type": explanation["video_type"],
+                "video_type_source": "gemini",
+                "gemini_received_audio": True,
+            },
+            "audio_cues": cue_artifact["cues"],
+            "rejected_cues": cue_artifact.get("rejected_cues") or [],
+            "annotation_provenance": {
+                "source": "gemini+dsp",
+                "annotation_type": "pseudo_ground_truth",
+                "human_verified": False,
+                "gemini_received_audio": True,
+                "model": cue_artifact.get("model"),
+                "explain_model": explanation.get("model"),
+                "processing_level": level,
+                "llm_call_count": ann_result.get("llm_call_count", 0),
+                "separation_used": bool(anchors_doc.get("separation_used")),
+                "anchor_counts": anchors_doc.get("counts"),
+                "generated_at": cue_artifact.get("generation_timestamp"),
+                "normalizations": cue_artifact.get("normalizations") or [],
+            },
+        }
         atomic_json(paths["record"], record)
+        ui_log.file_written("clip_pipeline", paths["record"], detail={"cue_count": len(cue_artifact["cues"])})
+        ui_log.step_end("clip_pipeline", "completed", outputs={"record": str(paths["record"])})
         _upsert_jsonl(output_dir / "dataset.jsonl", record)
         validate_record(record, video_meta["duration_ms"], paths, output_dir)
-        _update_splits_and_metadata(output_dir, video_dir.parent, video_id, video_model, gemini_model,
-                                    int(source_video_metadata.get("clip_duration_ms") or expected_ms))
+        _update_splits_and_metadata(
+            output_dir, video_dir.parent, video_id, video_model,
+            gemini_model or cfg.models.proposer,
+            int(source_video_metadata.get("clip_duration_ms") or expected_ms),
+            processing_level=level,
+        )
         validate_completed(paths, output_dir, video_id, clip_id)
         ledger["status"] = "completed"
         ledger["completed_at"] = utc_now()
         ledger["error"] = None
         _save_status(status_path, status_doc)
-        LOG.debug("[%s/%s] dataset record written; status=completed", video_id, clip_id)
+        LOG.debug("[%s/%s] dataset record written; status=completed level=%s", video_id, clip_id, level)
         return "processed"
     except BaseException as exc:
+        ui_log.message(f"Pipeline failed: {type(exc).__name__}: {exc}")
+        ui_log.step_end("clip_pipeline", f"failed: {exc}")
         if isinstance(exc, KeyboardInterrupt):
             ledger["status"] = "pending"
             ledger["error"] = "Interrupted; will resume using cached stage artifacts"
@@ -742,18 +876,27 @@ def validate_record(record: dict[str, Any], duration_ms: int, paths: dict[str, P
             or explanation.get("gemini_received_audio") is not True):
         raise ValueError("Gemini explanation artifact is invalid or lacks audiovisual provenance")
     cue_artifact = _load_json(paths["cues"])
-    if cue_artifact.get("annotation_type") != "pseudo_ground_truth" or cue_artifact.get("source") != "gemini" or cue_artifact.get("gemini_received_audio") is not True:
+    if cue_artifact.get("annotation_type") != "pseudo_ground_truth":
         raise ValueError("Cue annotation provenance is invalid")
+    if cue_artifact.get("source") not in VALID_SOURCES:
+        raise ValueError("Cue annotation source is invalid")
+    if cue_artifact.get("gemini_received_audio") is not True:
+        raise ValueError("Cue annotation missing audiovisual provenance")
     validate_cues(cue_artifact.get("cues"), duration_ms)
     if cue_artifact.get("cues") != record.get("audio_cues"):
         raise ValueError("Cue artifact and dataset record disagree")
     provenance = record.get("annotation_provenance", {})
-    if provenance.get("source") != "gemini" or provenance.get("annotation_type") != "pseudo_ground_truth" or provenance.get("human_verified") is not False:
+    if provenance.get("source") not in VALID_SOURCES or provenance.get("annotation_type") != "pseudo_ground_truth" or provenance.get("human_verified") is not False:
         raise ValueError("Dataset record provenance is invalid")
     if not paths["record"].is_file() or not paths["record"].stat().st_size:
         raise ValueError("Dataset record was not written")
-    if not any(json.loads(line).get("video_id") == record["video_id"] and json.loads(line).get("clip_id") == record["clip_id"]
-               for line in (output_dir / "dataset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()):
+    level = record.get("processing_level") or "low"
+    if not any(
+        r.get("video_id") == record["video_id"]
+        and r.get("clip_id") == record["clip_id"]
+        and (r.get("processing_level") or "low") == level
+        for r in _iter_jsonl_records(output_dir / "dataset.jsonl")
+    ):
         raise ValueError("Dataset JSONL record is missing")
 
 
@@ -768,24 +911,44 @@ def validate_completed(paths: dict[str, Path], output_dir: Path, video_id: str, 
         raise ValueError("Record identity mismatch")
 
 
+def _iter_jsonl_records(path: Path):
+    """Yield clip records from compact JSONL or legacy pretty-printed multi-line JSON."""
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    dec = json.JSONDecoder()
+    idx, n = 0, len(text)
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, end = dec.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            LOG.warning("Ignoring malformed JSONL fragment at offset %d", idx)
+            idx += 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        else:
+            LOG.warning("Ignoring non-object JSONL record (%s)", type(obj).__name__)
+        idx = end
+
+
 def _upsert_jsonl(path: Path, record: dict[str, Any]) -> None:
-    """Atomically replace or append one clip record in the JSONL dataset index."""
+    """Atomically replace or append one clip×level record in the JSONL index."""
     rows = {}
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                old = json.loads(line)
-                rows[(old.get("video_id"), old.get("clip_id"))] = old
-            except json.JSONDecodeError:
-                LOG.warning("Ignoring malformed existing JSONL row")
-    rows[(record["video_id"], record["clip_id"])] = record
+    for old in _iter_jsonl_records(path):
+        key = (old.get("video_id"), old.get("clip_id"), old.get("processing_level") or "low")
+        rows[key] = old
+    key = (record["video_id"], record["clip_id"], record.get("processing_level") or "low")
+    rows[key] = record
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as f:
-        for key in sorted(rows):
-            f.write(json.dumps(rows[key], ensure_ascii=False, separators=(",", ":")) + "\n")
+        for k in sorted(rows):
+            f.write(json.dumps(rows[k], ensure_ascii=False, separators=(",", ":")) + "\n")
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -798,7 +961,10 @@ def _split(video_id: str) -> str:
     return "train" if x < 80 else "validation" if x < 90 else "test"
 
 
-def _update_splits_and_metadata(output_dir: Path, input_dir: Path, current_video_id: str, video_model: str, gemini_model: str, clip_duration_ms: int) -> None:
+def _update_splits_and_metadata(
+    output_dir: Path, input_dir: Path, current_video_id: str, video_model: str, gemini_model: str,
+    clip_duration_ms: int, *, processing_level: str = "low",
+) -> None:
     """Rebuild source-level split lists and aggregate dataset metadata."""
     ids = set()
     dataset = output_dir / "dataset.jsonl"
@@ -818,16 +984,26 @@ def _update_splits_and_metadata(output_dir: Path, input_dir: Path, current_video
             ids.add(str(source_metadata.get("video_id") or source_dir.name))
         except Exception:
             continue
-    # Source clips include pending/failed clips; records count completed clips.
-    total_source_clips = max(total_source_clips, len(rows))
+    total_source_clips = max(total_source_clips, len({(r.get("video_id"), r.get("clip_id")) for r in rows}))
     splits = {name: sorted(v for v in ids if _split(v) == name) for name in ("train", "validation", "test")}
     atomic_json(output_dir / "splits.json", splits)
-    atomic_json(output_dir / "dataset_metadata.json", {"dataset_version": "1.0.0", "pipeline_version": PIPELINE_VERSION,
-                "created_at": utc_now(), "clip_duration_ms": clip_duration_ms, "overlap_ms": 0,
-                "video_model": video_model, "gemini_model": gemini_model, "gemini_received_audio": True,
-                "annotation_type": "pseudo_ground_truth", "annotation_source": "Gemini",
-                "number_of_source_videos": len(ids), "number_of_clips": total_source_clips,
-                "number_of_completed_clips": len(rows), "split_policy": "stable SHA-256 bucket by source video_id (80/10/10)"})
+    atomic_json(output_dir / "dataset_metadata.json", {
+        "dataset_version": SCHEMA_VERSION,
+        "pipeline_version": PIPELINE_VERSION,
+        "created_at": utc_now(),
+        "clip_duration_ms": clip_duration_ms,
+        "overlap_ms": 0,
+        "video_model": video_model,
+        "gemini_model": gemini_model,
+        "gemini_received_audio": True,
+        "annotation_type": "pseudo_ground_truth",
+        "annotation_source": "gemini+dsp",
+        "processing_level_last": processing_level,
+        "number_of_source_videos": len(ids),
+        "number_of_clips": total_source_clips,
+        "number_of_completed_records": len(rows),
+        "split_policy": "stable SHA-256 bucket by source video_id (80/10/10)",
+    })
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -917,6 +1093,8 @@ def discover(input_dir: Path, video_filter: str | None, clip_filter: str | None)
 
 def main(argv: list[str] | None = None) -> int:
     """Parse build options, process discovered clips, and update dataset summaries."""
+    from core.config import load_pipeline_config
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=ROOT / "Dataset" / "raw_videos")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "Dataset" / "extracted")
@@ -926,6 +1104,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--video-model", default=VIDEO_MODEL_DEFAULT)
     parser.add_argument("--gemini-model", default=os.getenv("GEMINI_VIDEO_EXPLAIN_MODEL", GEMINI_MODEL_DEFAULT))
+    parser.add_argument(
+        "--processing-level", choices=("low", "high"), default="low",
+        help="low = Layer 0 + one anchored Gemini call; high = Demucs + per-window proposers + judge",
+    )
+    parser.add_argument(
+        "--anchor-version", type=int, choices=(1, 2), default=None,
+        help="Layer-0 anchor algorithm version (1=legacy, 2=SuperFlux+SED). Default from pipeline_config.json.",
+    )
+    parser.add_argument(
+        "--apply-av-offset", action="store_true",
+        help="Apply estimated A/V offset to audio anchors (default: warn only).",
+    )
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
@@ -935,6 +1125,38 @@ def main(argv: list[str] | None = None) -> int:
     _load_local_env()
     if not args.input_dir.is_dir():
         parser.error(f"Input directory does not exist: {args.input_dir}")
+
+    overrides: dict = {}
+    if args.anchor_version is not None:
+        overrides["anchor_version"] = args.anchor_version
+        overrides["perception"] = {"anchor_version": args.anchor_version}
+    if args.apply_av_offset:
+        overrides["apply_av_offset"] = True
+    pipeline_cfg = load_pipeline_config(args.processing_level, overrides=overrides or None)
+    from dataclasses import replace
+    if args.apply_av_offset:
+        pipeline_cfg = replace(pipeline_cfg, apply_av_offset=True)
+    # Honour --gemini-model as an override for the explain/proposer models.
+    if args.gemini_model and args.gemini_model != GEMINI_MODEL_DEFAULT:
+        from core.schemas import ModelConfig
+        pipeline_cfg = replace(
+            pipeline_cfg,
+            models=ModelConfig(
+                explain=args.gemini_model,
+                proposer=args.gemini_model,
+                judge=pipeline_cfg.models.judge,
+            ),
+        )
+    LOG.info(
+        "Processing level=%s anchor_v=%s (separation=%s per_window=%s audio_only=%s judge=%s)",
+        pipeline_cfg.level,
+        pipeline_cfg.anchor_version,
+        pipeline_cfg.flags.separation,
+        pipeline_cfg.flags.per_window_proposer,
+        pipeline_cfg.flags.audio_only_pass,
+        pipeline_cfg.flags.llm_judge,
+    )
+
     lock = None
     counts = {"processed": 0, "skipped": 0, "failed": 0}
     try:
@@ -947,7 +1169,6 @@ def main(argv: list[str] | None = None) -> int:
         total = len(items)
         if not items:
             raise RuntimeError("No clips discovered under input directory")
-        # Group clips so normal progress output summarizes videos instead of listing every clip.
         videos: dict[str, list[tuple[Path, dict[str, Any], Path, dict[str, Any]]]] = {}
         for item in items:
             videos.setdefault(item[0].name, []).append(item)
@@ -957,9 +1178,16 @@ def main(argv: list[str] | None = None) -> int:
         for video_id, video_items in videos.items():
             video_counts = {"processed": 0, "skipped": 0, "failed": 0}
             for video_dir, clip, status_path, status in video_items:
-                outcome = process_clip(video_dir, clip, args.output_dir, status_path, status,
-                                       video_model=args.video_model, gemini_model=args.gemini_model,
-                                       device=args.device, max_retries=args.max_retries, force=args.force)
+                outcome = process_clip(
+                    video_dir, clip, args.output_dir, status_path, status,
+                    video_model=args.video_model,
+                    gemini_model=pipeline_cfg.models.explain,
+                    device=args.device,
+                    max_retries=args.max_retries,
+                    force=args.force,
+                    processing_level=pipeline_cfg.level,
+                    pipeline_cfg=pipeline_cfg,
+                )
                 counts[outcome] += 1
                 video_counts[outcome] += 1
 
@@ -967,8 +1195,9 @@ def main(argv: list[str] | None = None) -> int:
                 videos_skipped += 1
 
         LOG.info(
-            "Dataset build complete: skipped %d/%d videos and %d/%d clips; processed %d clips; failed %d.",
-            videos_skipped, total_videos, counts["skipped"], total, counts["processed"], counts["failed"],
+            "Dataset build complete (level=%s): skipped %d/%d videos and %d/%d clips; processed %d; failed %d.",
+            pipeline_cfg.level, videos_skipped, total_videos,
+            counts["skipped"], total, counts["processed"], counts["failed"],
         )
         return 1 if counts["failed"] else 0
     except KeyboardInterrupt:

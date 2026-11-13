@@ -215,12 +215,16 @@ def query_gemini_multimodal(
     video_bytes: bytes,
     mime_type: str,
     api_key: str = "",
+    video_fps: Optional[int] = None,
 ):
     """
-    Send text + video to Gemini and return parsed JSON (dict or list).
+    Send text + video/audio to Gemini and return parsed JSON (dict or list).
 
     Uses inline bytes for smaller payloads; above GEMINI_INLINE_VIDEO_MAX_BYTES
     uploads via the Files API, waits until ACTIVE, then generates.
+
+    ``video_fps`` (optional) requests a higher frame sampling rate for video
+    parts via ``types.VideoMetadata``. Ignored for audio-only mime types.
     """
     key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
@@ -243,14 +247,34 @@ def query_gemini_multimodal(
                 return None
             return _parse_json_from_llm_text(response_text)
 
-        video_part = types.Part.from_bytes(data=video_bytes, mime_type=mime_type)
+        is_audio = (mime_type or "").lower().startswith("audio/")
+        part_kwargs: dict = {"data": video_bytes, "mime_type": mime_type}
+        # Attach VideoMetadata only for real video parts when fps is requested.
+        if video_fps and not is_audio:
+            try:
+                media_part = types.Part(
+                    inline_data=types.Blob(data=video_bytes, mime_type=mime_type),
+                    video_metadata=types.VideoMetadata(fps=float(video_fps)),
+                )
+            except Exception:
+                media_part = types.Part.from_bytes(**part_kwargs)
+        else:
+            media_part = types.Part.from_bytes(**part_kwargs)
 
         if len(video_bytes) <= GEMINI_INLINE_VIDEO_MAX_BYTES:
-            # SDK accepts mixed str + Part in contents list
-            return _generate([prompt, video_part])
+            return _generate([prompt, media_part])
 
-        # Files API path for large videos
-        suffix = ".mp4" if "mp4" in mime_type else ".webm" if "webm" in mime_type else ".bin"
+        # Files API path for large videos / audio
+        if "mp4" in mime_type:
+            suffix = ".mp4"
+        elif "webm" in mime_type:
+            suffix = ".webm"
+        elif "wav" in mime_type:
+            suffix = ".wav"
+        elif "mpeg" in mime_type or "mp3" in mime_type:
+            suffix = ".mp3"
+        else:
+            suffix = ".bin"
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(suffix=suffix)
