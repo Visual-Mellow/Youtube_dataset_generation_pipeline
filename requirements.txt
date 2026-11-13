@@ -1,13 +1,42 @@
-# Python 3.12.
-# These versions were installed together and `python -m pip check` reported no broken requirements.
+# VisualMellow YouTube dataset pipeline — Python 3.12 recommended.
+# Install:  python -m pip install -r requirements.txt
+# Or:       python setup_workspace.py --install
+
+# --- Acquire / media ---
 yt-dlp==2026.8.19
 opencv-python-headless==5.0.0.93
-numpy==2.5.3
-torch==2.14.1
-transformers==5.19.0
+av>=12.0.0
 Pillow==12.3.0
+
+# --- Core numerics / DSP ---
+numpy==2.5.3
+scipy>=1.11.0
+librosa>=1.0.0
+soundfile>=0.12.0
+numba>=0.59.0
+scenedetect[opencv]>=0.6.4
+
+# --- Deep learning (VideoMAE, Demucs, PANNs, Whisper) ---
+torch==2.14.1
+torchaudio>=2.0.0
+transformers==5.19.0
+einops>=0.7.0
+panns-inference>=0.1.1
+faster-whisper>=1.0.0
+demucs>=4.0.0
+
+# --- Gemini + prompts (Utils/llm.py, Utils/prompts.py) ---
 python-dotenv==1.2.4
 google-genai==2.28.0
 langchain-core==1.6.7
+
+# --- Optional: audio vocoder used elsewhere in VisualMellow ---
+# Skip if you only need this YouTube dataset pipeline.
 BigVGAN==2.4.0
-# pip install -e git+https://github.com/awei-6/BigVGAN.git@main#egg=BigVGAN
+# Alternative source if PyPI wheel fails:
+# pip install -e "git+https://github.com/awei-6/BigVGAN.git@main#egg=BigVGAN"
+
+# --- Notebooks / diagnostics (data_analysis/, tools/) ---
+matplotlib>=3.8.0
+jupyter>=1.0.0
+ipykernel>=6.0.0

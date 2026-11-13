@@ -1,0 +1,120 @@
+{
+  "default_level": "low",
+  "anchor_version": 2,
+  "models": {
+    "explain": "gemini-3-flash-preview",
+    "proposer": "gemini-3-flash-preview",
+    "judge": "gemini-3.1-pro-preview"
+  },
+  "segmentation": {
+    "mode": "scene",
+    "target_clip_s": 30,
+    "max_clip_s": 40,
+    "min_tail_s": 12,
+    "scene_threshold": 27.0,
+    "min_scene_len_frames": 15
+  },
+  "windows": {
+    "window_ms": 6000,
+    "window_overlap_ms": 1000,
+    "cut_snap_tol_ms": 1500,
+    "max_anchors_per_window": 40
+  },
+  "snap": {
+    "version": 2,
+    "sfx_snap_ms": 250,
+    "bed_snap_ms": 600,
+    "audibility_tol_ms": 150,
+    "min_impact_gap_ms": 150,
+    "dedupe_ms": 40,
+    "near_cut_tol_ms": 300,
+    "assign_window_ms": 400,
+    "max_cost": 0.85,
+    "w_t": 0.45,
+    "w_c": 0.30,
+    "w_s": 0.15,
+    "w_stem": 0.10
+  },
+  "perception": {
+    "sample_rate": 16000,
+    "onset_hop_ms": 10,
+    "onset_delta": 0.6,
+    "onset_min_gap_ms": 100,
+    "tagger_topk": 5,
+    "whisper_model": "small",
+    "gemini_video_fps": 5,
+    "anchor_fps": 15,
+    "anchor_version": 2,
+    "onsets_v2": {
+      "enabled": true,
+      "sr_dsp": 32000,
+      "n_fft": 1024,
+      "hop": 160,
+      "win_length": 512,
+      "bands_hz": [[0, 500], [500, 2000], [2000, 8000], [8000, 16000]],
+      "mad_k": 3.5,
+      "median_win_ms": 600,
+      "min_gap_ms": 35,
+      "dense_min_gap_ms": 20,
+      "cross_band_merge_ms": 25,
+      "refine": {
+        "pre_ms": 120,
+        "post_ms": 60,
+        "env_smooth_ms": 2,
+        "floor_db": 6,
+        "min_snr_db": 6
+      },
+      "offset": {
+        "decay_db_below_peak": 30,
+        "max_event_ms": { "impact": 1500, "default": 3000 }
+      }
+    },
+    "sed": {
+      "enabled": true,
+      "backend": "panns_cnn14_sed",
+      "on_thr": 0.5,
+      "off_thr": 0.3,
+      "min_dur_ms": 40,
+      "merge_gap_ms": 80,
+      "gate_search_ms": 250,
+      "median_frames": 3
+    },
+    "video_cues_v2": {
+      "enabled": true,
+      "use_farneback": true,
+      "use_transnet": false,
+      "min_intensity_change": 5.0
+    },
+    "fusion": {
+      "audio_cluster_ms": 40,
+      "visual_attach_ms": 100,
+      "w_onset": 0.35,
+      "w_sed": 0.30,
+      "w_snr": 0.15,
+      "w_visual": 0.15,
+      "w_beat": 0.05
+    }
+  },
+  "levels": {
+    "low": {
+      "audio_only_pass": false,
+      "llm_judge": false,
+      "separation": false,
+      "per_window_proposer": false,
+      "sed_backend": "windowed_tagger",
+      "video_cues_v2": true,
+      "snap_v2": true,
+      "description": "Layer 0 v2 onsets + light SED tagger; one anchored Gemini cue call."
+    },
+    "high": {
+      "audio_only_pass": true,
+      "llm_judge": true,
+      "separation": true,
+      "per_window_proposer": true,
+      "sed_backend": "panns_cnn14_sed",
+      "video_cues_v2": true,
+      "snap_v2": true,
+      "description": "Full multi-agent + Demucs + SED on effects + snap v2."
+    }
+  }
+}

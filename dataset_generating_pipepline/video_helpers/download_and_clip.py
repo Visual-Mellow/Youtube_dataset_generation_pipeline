@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +18,12 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 LOG = logging.getLogger("visualmellow.acquire")
-ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_DIR = Path(__file__).resolve().parents[1]  # dataset_generating_pipepline/
+ROOT = PIPELINE_DIR.parent  # repository root
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_OUTPUT = ROOT / "Dataset" / "raw_videos"
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v"}
 
@@ -231,20 +237,48 @@ def download(url: str, folder: Path, force: bool, video_id: str, info: dict[str,
     return target, {**downloaded_info, **probe(target), "id": video_id, "reused": False}
 
 
-def write_clips(source: Path, folder: Path, clip_seconds: int, duration_ms: int, force: bool = False) -> list[dict[str, Any]]:
-    """Create or reuse contiguous clips and return their exact source intervals."""
+def write_clips(
+    source: Path,
+    folder: Path,
+    clip_seconds: int,
+    duration_ms: int,
+    force: bool = False,
+    *,
+    segmentation: str = "scene",
+    seg_config: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Create or reuse clips and return their exact source intervals.
+
+    ``segmentation`` is ``\"scene\"`` (PySceneDetect grouping, default) or
+    ``\"fixed\"`` (legacy contiguous fixed-duration slices).
+    """
     folder.mkdir(parents=True, exist_ok=True)
-    clip_ms = clip_seconds * 1000
-    # Avoid floating-point boundary drift; the final endpoint is the probed source endpoint.
+    from video_helpers.segment_clips import plan_clip_intervals
+    from core.config import load_pipeline_config
+    from core.schemas import SegmentationConfig
+
+    if seg_config is None:
+        # Build a SegmentationConfig from the pipeline JSON, then honour the
+        # caller's mode / target duration overrides.
+        base = load_pipeline_config().segmentation
+        seg_config = SegmentationConfig(
+            mode=segmentation,
+            target_clip_s=float(clip_seconds),
+            max_clip_s=base.max_clip_s,
+            min_tail_s=base.min_tail_s,
+            scene_threshold=base.scene_threshold,
+            min_scene_len_frames=base.min_scene_len_frames,
+        )
+    intervals = plan_clip_intervals(source, duration_ms, seg_config)
+
     clips: list[dict[str, Any]] = []
-    start = 0
-    index = 0
-    while start < duration_ms:
-        end = min(start + clip_ms, duration_ms)
+    for index, interval in enumerate(intervals):
+        start = int(interval["source_start_ms"])
+        end = int(interval["source_end_ms"])
+        actual_ms = end - start
         clip_id = f"clip_{index:03d}"
         name = f"{clip_id}.mp4"
         path = folder / name
-        actual_ms = end - start
         reusable = False
         if path.exists() and not force:
             try:
@@ -252,17 +286,22 @@ def write_clips(source: Path, folder: Path, clip_seconds: int, duration_ms: int,
             except Exception:
                 reusable = False
         if not reusable:
-            # Seeking before input keeps extraction fast; FFmpeg accurately decodes from the seek point.
-            run(["ffmpeg", "-y", "-ss", f"{start / 1000:.3f}", "-i", str(source), "-t", f"{actual_ms / 1000:.3f}",
+            # Accurate seek: -ss after -i (re-encode). Avoids keyframe A/V start skew from -c copy / input seek.
+            run(["ffmpeg", "-y", "-i", str(source), "-ss", f"{start / 1000:.3f}", "-t", f"{actual_ms / 1000:.3f}",
                  "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                  "-c:a", "aac", "-movflags", "+faststart", str(path)])
         clip_info = probe(path)
         if abs(clip_info["duration_ms"] - actual_ms) > 250:
             raise RuntimeError(f"Clip duration mismatch for {clip_id}: wanted {actual_ms}ms, got {clip_info['duration_ms']}ms")
-        clips.append({"clip_id": clip_id, "filename": name, "source_start_ms": start,
-                      "source_end_ms": end, "duration_ms": actual_ms})
-        start = end
-        index += 1
+        clips.append({
+            "clip_id": clip_id,
+            "filename": name,
+            "source_start_ms": start,
+            "source_end_ms": end,
+            "duration_ms": actual_ms,
+            "scene_boundaries_ms": list(interval.get("scene_boundaries_ms") or []),
+            "segmentation": seg_config.mode,
+        })
     return clips
 
 
@@ -287,7 +326,14 @@ def update_ledger(path: Path, video_id: str, clips: list[dict[str, Any]]) -> Non
     atomic_json(path, {"schema_version": "1.0", "video_id": video_id, "updated_at": now(), "clips": new})
 
 
-def acquire_url(url: str, output_dir: Path, clip_duration: int, force: bool = False) -> dict[str, Any]:
+def acquire_url(
+    url: str,
+    output_dir: Path,
+    clip_duration: int,
+    force: bool = False,
+    *,
+    segmentation: str = "scene",
+) -> dict[str, Any]:
     """Download one URL, split it into clips, and return the acquisition record.
 
     Raises when the video cannot be downloaded or clipped. Callers that walk a
@@ -318,18 +364,25 @@ def acquire_url(url: str, output_dir: Path, clip_duration: int, force: bool = Fa
     source_meta = probe(source)
     if not source_meta["has_audio"]:
         raise ValueError(f"Downloaded source has no audio stream: {source}")
-    clips = write_clips(source, folder, clip_duration, source_meta["duration_ms"], force)
+    clips = write_clips(
+        source, folder, clip_duration, source_meta["duration_ms"], force,
+        segmentation=segmentation,
+    )
     metadata = {"video_id": video_id, "youtube_url": url,
                 "title": info.get("title"), "source_duration_ms": source_meta["duration_ms"],
                 "fps": source_meta["fps"], "width": source_meta["width"], "height": source_meta["height"],
                 "downloaded_filename": source.name,
                 "download_timestamp": prior_metadata.get("download_timestamp") if info.get("reused") else now(),
-                "processed_at": now(), "clip_duration_ms": clip_duration * 1000, "clips": clips}
+                "processed_at": now(), "clip_duration_ms": clip_duration * 1000,
+                "segmentation": segmentation, "clips": clips}
     metadata["download_timestamp"] = info.get("download_timestamp") or now()
     metadata["source_reused"] = bool(info.get("reused"))
     atomic_json(folder / "video_metadata.json", metadata)
     update_ledger(folder / "processing_status.json", video_id, clips)
-    LOG.info("Acquired %s: %d contiguous clips (%ds target), directory %s", video_id, len(clips), clip_duration, folder)
+    LOG.info(
+        "Acquired %s: %d clips (%ds target, segmentation=%s), directory %s",
+        video_id, len(clips), clip_duration, segmentation, folder,
+    )
     return metadata
 
 
@@ -338,14 +391,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--clip-duration", type=int, default=30, help="Clip length in seconds (default: 30)")
+    parser.add_argument("--clip-duration", type=int, default=30, help="Target clip length in seconds (default: 30)")
+    parser.add_argument(
+        "--segmentation",
+        choices=("scene", "fixed"),
+        default="scene",
+        help="scene = PySceneDetect grouping (default); fixed = contiguous fixed-duration slices",
+    )
     parser.add_argument("--force", action="store_true", help="Redownload source and recreate clips")
     args = parser.parse_args(argv)
     if args.clip_duration <= 0:
         parser.error("--clip-duration must be a positive number of seconds")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
-        acquire_url(args.url, args.output_dir, args.clip_duration, args.force)
+        acquire_url(
+            args.url, args.output_dir, args.clip_duration, args.force,
+            segmentation=args.segmentation,
+        )
         return 0
     except Exception as exc:
         LOG.error("Acquisition failed: video is not downloadable: %s", exc)

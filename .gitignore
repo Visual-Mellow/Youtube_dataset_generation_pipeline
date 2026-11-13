@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+.numba_cache/
 
 # C extensions
 *.so
@@ -220,9 +221,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Pipeline outputs. The only tracked dataset input is Dataset/metadata/youtube_links.csv.
+# Fresh clones: run `python setup_workspace.py` to recreate these directories.
 Dataset/extracted/
 Dataset/raw_videos/
 Dataset/videos/
+Dataset/clips/
 Dataset/metadata/*
 !Dataset/metadata/youtube_links.csv
 *.mp4
@@ -232,3 +235,5 @@ Dataset/metadata/*
 *.mov
 *.pt
 *.tmp
+
+graphify-out/

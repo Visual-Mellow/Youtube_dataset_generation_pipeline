@@ -1,0 +1,20 @@
+{
+  "timestamp": "20261112T114755Z",
+  "level": "high",
+  "anchor_version": 1,
+  "n_gold_files": 0,
+  "message": "no gold",
+  "aggregate": {
+    "n_clips": 0,
+    "n_matched_onsets": 0,
+    "median_onset_err_ms": null,
+    "p90_onset_err_ms": null,
+    "pct_within_20": 0.0,
+    "pct_within_50": 0.0,
+    "pct_within_100": 0.0,
+    "pct_within_200": 0.0,
+    "precision_50": 0.0,
+    "recall_50": 0.0,
+    "f1_50": 0.0
+  }
+}
